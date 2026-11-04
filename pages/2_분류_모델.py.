@@ -1,0 +1,420 @@
+# -*- coding: utf-8 -*-
+"""분류 모델 페이지: 로지스틱 회귀와 의사결정트리로 뇌졸중 여부를 맞혀 본다."""
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier
+
+st.set_page_config(page_title="분류 모델", layout="wide")
+
+# ---------------------------------------------------------------------------
+# 설정
+# ---------------------------------------------------------------------------
+# 첫 화면과 같은 데이터 주소를 여기에 넣어 주세요. (UTF-8로 읽습니다)
+DATA_URL = ""
+
+FEATURES = ["age", "avg_glucose_level", "bmi", "hypertension", "heart_disease"]
+DEFAULT_FEATURES = ["age", "avg_glucose_level", "hypertension", "heart_disease"]
+KOREAN = {
+    "age": "나이",
+    "avg_glucose_level": "평균 혈당",
+    "bmi": "체질량지수",
+    "hypertension": "고혈압",
+    "heart_disease": "심장병",
+}
+BINARY = {"hypertension", "heart_disease"}  # 0 또는 1 값을 가진 속성
+
+LOGIT_NAME = "로지스틱 회귀(확률로 답하는 모델)"
+TREE_NAME = "의사결정트리(질문으로 답하는 모델)"
+BASE_NAME = "다수 클래스 모델(입력을 하나도 보지 않고 훈련용에서 많은 쪽으로만 답하는 모델)"
+
+# 뇌졸중 아님 = 파랑, 뇌졸중(양성) = 주황 (색맹에도 구분되는 조합)
+BLUE = "#2a78c8"
+ORANGE = "#e8710a"
+BLUE_LIGHT = "rgba(42, 120, 200, 0.14)"
+ORANGE_LIGHT = "rgba(232, 113, 10, 0.20)"
+LINE_COLOR = "#8e44ad"
+
+
+# ---------------------------------------------------------------------------
+# 데이터
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner="데이터를 불러오는 중입니다...")
+def load_data(url):
+    return pd.read_csv(url, encoding="utf-8")
+
+
+def prepare(raw):
+    """필요한 열을 숫자로 바꾸고, 번호(id) 순으로 정렬한다."""
+    needed = ["id", "stroke"] + FEATURES
+    missing = [c for c in needed if c not in raw.columns]
+    if missing:
+        st.error("데이터에 다음 열이 없습니다: " + ", ".join(missing))
+        st.stop()
+    df = raw.copy()
+    for c in needed:
+        df[c] = pd.to_numeric(df[c], errors="coerce")  # bmi의 'N/A' 같은 값은 빈칸이 된다
+    return df.sort_values("id", kind="stable").reset_index(drop=True)
+
+
+def split_train_test(df):
+    """열 명씩 묶어 각 묶음의 앞 세 명을 테스트용으로 고정한다."""
+    is_test = (np.arange(len(df)) % 10) < 3
+    return df[~is_test].reset_index(drop=True), df[is_test].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 화면 조각
+# ---------------------------------------------------------------------------
+def accuracy_card(col, name, train_acc, test_acc):
+    html = (
+        f'<div style="min-height:3.6em;font-weight:600;line-height:1.35;">{name}</div>'
+        f'<div style="font-size:2.8rem;font-weight:700;line-height:1.2;margin-top:0.2em;">'
+        f"{test_acc * 100:.2f}%</div>"
+        f'<div style="font-size:0.75rem;opacity:0.7;margin-bottom:0.6em;">테스트 데이터의 정확도</div>'
+        f'<div style="display:flex;gap:1.5em;font-size:0.8rem;opacity:0.85;">'
+        f"<span>훈련 정확도 {train_acc * 100:.2f}%</span>"
+        f"<span>테스트 정확도 {test_acc * 100:.2f}%</span></div>"
+    )
+    with col:
+        with st.container(border=True):
+            st.markdown(html, unsafe_allow_html=True)
+
+
+def value_text(feat, value):
+    if feat in BINARY:
+        return "있음" if value >= 0.5 else "없음"
+    return f"{value:.1f}"
+
+
+def axis_range(series, feat):
+    if feat in BINARY:
+        return -0.25, 1.25
+    lo, hi = float(series.min()), float(series.max())
+    pad = (hi - lo) * 0.05 or 1.0
+    return lo - pad, hi + pad
+
+
+def logistic_line(logit, selected, fixed, x_feat, y_feat, xr, yr):
+    """확률 0.5 경계선(z = 0)을 그림 상자 안에서 잘라 돌려준다.
+
+    로지스틱 회귀의 경계선은 원래 값 기준으로 직선이다.
+    z = b0 + sum(w_i * v_i) 이고, 두 축이 아닌 속성은 고정된 값을 쓴다.
+    """
+    scaler = logit.named_steps["standardscaler"]
+    lr = logit.named_steps["logisticregression"]
+    w = lr.coef_[0] / scaler.scale_
+    b0 = float(lr.intercept_[0] - np.sum(lr.coef_[0] * scaler.mean_ / scaler.scale_))
+    idx = {f: i for i, f in enumerate(selected)}
+    a = b0 + sum(w[idx[f]] * fixed[f] for f in selected if f not in (x_feat, y_feat))
+    bx, by = float(w[idx[x_feat]]), float(w[idx[y_feat]])
+
+    pts = []
+    for x in xr:
+        if abs(by) > 1e-12:
+            y = -(a + bx * x) / by
+            if yr[0] <= y <= yr[1]:
+                pts.append((x, y))
+    for y in yr:
+        if abs(bx) > 1e-12:
+            x = -(a + by * y) / bx
+            if xr[0] <= x <= xr[1]:
+                pts.append((x, y))
+    uniq = []
+    for p in pts:
+        if not any(abs(p[0] - q[0]) < 1e-9 and abs(p[1] - q[1]) < 1e-9 for q in uniq):
+            uniq.append(p)
+
+    corners = [a + bx * x + by * y for x in xr for y in yr]
+    side = None
+    if max(corners) < 0:
+        side = "아님"
+    elif min(corners) >= 0:
+        side = "뇌졸중"
+
+    if len(uniq) < 2:
+        return None, side
+    best = max(
+        ((p, q) for p in uniq for q in uniq),
+        key=lambda pq: (pq[0][0] - pq[1][0]) ** 2 + (pq[0][1] - pq[1][1]) ** 2,
+    )
+    return best, side
+
+
+def tree_dot(tree, X_train, y_train, selected):
+    """의사결정트리를 DOT 문자열로 바꾼다. 마디마다 훈련용 사람 수와 뇌졸중 수를 적는다."""
+    t = tree.tree_
+    path = tree.decision_path(X_train)  # 훈련 자료가 지나간 마디를 센다
+    n_all = np.asarray(path.sum(axis=0)).ravel()
+    n_pos = np.asarray(path[(y_train.to_numpy() == 1)].sum(axis=0)).ravel()
+
+    lines = [
+        "digraph tree {",
+        'graph [rankdir=TB, bgcolor="white", nodesep=0.35, ranksep=0.6];',
+        'node [shape=box, style="rounded,filled", fontname="sans-serif", fontsize=12, '
+        'fontcolor="black", color="#555555"];',
+        'edge [fontname="sans-serif", fontsize=12, fontcolor="black", color="#555555"];',
+    ]
+    leaf_answers = []
+    asked = set()
+    for i in range(t.node_count):
+        n, k = int(n_all[i]), int(n_pos[i])
+        stat = f"훈련용 {n}명 중 뇌졸중 {k}명 ({k / n * 100:.1f}%)"
+        left, right = t.children_left[i], t.children_right[i]
+        if left == -1:  # 더 묻지 않고 답을 내는 마디
+            answer = int(np.argmax(t.value[i][0]))
+            leaf_answers.append(answer)
+            text = "뇌졸중" if answer == 1 else "아님"
+            fill = "#fbd5b5" if answer == 1 else "#cfe2f3"
+            lines.append(f'n{i} [label="답: {text}\\n{stat}", fillcolor="{fill}"];')
+            continue
+        feat = selected[t.feature[i]]
+        asked.add(feat)
+        thr = float(t.threshold[i])
+        name = KOREAN[feat]
+        if feat in BINARY:
+            question = f"{name}이 있나요?"
+        elif feat == "age":
+            question = f"나이가 {thr:.1f}세 이하인가요?"
+        elif feat == "avg_glucose_level":
+            question = f"평균 혈당이 {thr:.1f} 이하인가요?"
+        else:
+            question = f"체질량지수가 {thr:.1f} 이하인가요?"
+        lines.append(f'n{i} [label="{question}\\n{stat}", fillcolor="#eeeeee"];')
+        # 값이 기준 이하인 쪽이 왼쪽이다. 고혈압·심장병은 '있음'(1)이 오른쪽이다.
+        yes_child, no_child = (right, left) if feat in BINARY else (left, right)
+        lines.append(f'n{i} -> n{yes_child} [label=" 예"];')
+        lines.append(f'n{i} -> n{no_child} [label=" 아니요"];')
+    lines.append("}")
+    asked_in_order = [f for f in selected if f in asked]
+    return "\n".join(lines), leaf_answers, asked_in_order
+
+
+# ---------------------------------------------------------------------------
+# 페이지
+# ---------------------------------------------------------------------------
+st.title("분류 모델")
+st.write("나이·혈당 같은 정보만으로 뇌졸중 여부를 얼마나 맞힐 수 있는지 두 가지 모델로 살펴봅니다.")
+
+if not DATA_URL.strip():
+    st.error("파일 맨 위의 DATA_URL에 첫 화면과 같은 데이터 주소를 넣어 주세요.")
+    st.stop()
+
+try:
+    raw = load_data(DATA_URL)
+except Exception as e:  # noqa: BLE001
+    st.error(f"데이터를 불러오지 못했습니다: {e}")
+    st.stop()
+
+df = prepare(raw)
+
+selected = st.multiselect(
+    "입력으로 사용할 속성",
+    options=FEATURES,
+    default=DEFAULT_FEATURES,
+    format_func=lambda f: KOREAN[f],
+)
+selected = [f for f in FEATURES if f in selected]  # 고른 순서와 상관없이 늘 같은 순서로
+if len(selected) < 2:
+    st.warning("입력 속성을 두 개 이상 골라 주세요. 두 개보다 적으면 모델과 그림을 만들 수 없습니다.")
+    st.stop()
+
+# bmi를 뺀 나머지 열에 빈칸이 있으면 멈춘다 (bmi만 훈련용 중앙값으로 채운다)
+check_cols = ["stroke"] + [f for f in selected if f != "bmi"]
+if df[check_cols].isna().any().any():
+    bad = [c for c in check_cols if df[c].isna().any()]
+    st.error("다음 열에 비어 있거나 숫자가 아닌 값이 있어 진행할 수 없습니다: " + ", ".join(bad))
+    st.stop()
+
+train, test = split_train_test(df)
+X_train, X_test = train[selected].copy(), test[selected].copy()
+y_train, y_test = train["stroke"].astype(int), test["stroke"].astype(int)
+
+st.caption(
+    f"뇌졸중(stroke=1)을 양성으로 둡니다. 번호(id) 순으로 정렬해 열 명씩 묶고, 각 묶음의 앞 세 명을 "
+    f"테스트용({len(test):,}명)으로 고정했습니다. 나머지 {len(train):,}명으로만 학습과 크기 맞추기를 합니다."
+)
+
+if "bmi" in selected:
+    bmi_median = float(X_train["bmi"].median())
+    n_na_train, n_na_test = int(X_train["bmi"].isna().sum()), int(X_test["bmi"].isna().sum())
+    X_train["bmi"] = X_train["bmi"].fillna(bmi_median)
+    X_test["bmi"] = X_test["bmi"].fillna(bmi_median)
+    st.caption(
+        f"체질량지수가 비어 있는 사람(훈련용 {n_na_train:,}명, 테스트용 {n_na_test:,}명)은 "
+        f"훈련용의 중앙값 {bmi_median:.1f}으로 채웠습니다."
+    )
+
+# --- 모델 만들기 -----------------------------------------------------------
+logit = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
+logit.fit(X_train, y_train)  # 크기 맞추기도 훈련용으로만 계산된다
+
+tree = DecisionTreeClassifier(max_depth=3, min_samples_split=5, random_state=42)
+tree.fit(X_train, y_train)
+st.caption(
+    "의사결정트리는 값의 크기에 영향을 받지 않아 크기 맞추기 없이 원래 값으로 학습했습니다. "
+    "질문은 세 번까지만 던지고, 마디에 사람이 다섯 명 미만이면 더 나누지 않습니다."
+)
+
+baseline = DummyClassifier(strategy="most_frequent")
+baseline.fit(X_train, y_train)
+
+
+def accuracies(model):
+    return (
+        accuracy_score(y_train, model.predict(X_train)),
+        accuracy_score(y_test, model.predict(X_test)),
+    )
+
+
+# --- 정확도 카드 -----------------------------------------------------------
+st.subheader("정확도")
+c1, c2, c3 = st.columns(3)
+accuracy_card(c1, LOGIT_NAME, *accuracies(logit))
+accuracy_card(c2, TREE_NAME, *accuracies(tree))
+accuracy_card(c3, BASE_NAME, *accuracies(baseline))
+
+# --- 산점도 ----------------------------------------------------------------
+st.subheader("테스트 데이터와 두 모델이 가르는 자리")
+sc1, sc2 = st.columns(2)
+x_feat = sc1.selectbox("가로축", selected, index=0, format_func=lambda f: KOREAN[f])
+y_options = [f for f in selected if f != x_feat]
+y_feat = sc2.selectbox("세로축", y_options, index=0, format_func=lambda f: KOREAN[f])
+
+fixed = X_test.median()  # 두 축이 아닌 속성을 세워 둘 값
+xr = axis_range(X_test[x_feat], x_feat)
+yr = axis_range(X_test[y_feat], y_feat)
+
+fig = go.Figure()
+
+# 의사결정트리가 나눈 칸 (옅은 색)
+xs = np.linspace(xr[0], xr[1], 160)
+ys = np.linspace(yr[0], yr[1], 160)
+gx, gy = np.meshgrid(xs, ys)
+grid = pd.DataFrame({f: np.full(gx.size, fixed[f]) for f in selected})
+grid[x_feat] = gx.ravel()
+grid[y_feat] = gy.ravel()
+region = tree.predict(grid[selected]).reshape(gx.shape)
+fig.add_trace(
+    go.Heatmap(
+        x=xs,
+        y=ys,
+        z=region,
+        zmin=0,
+        zmax=1,
+        colorscale=[[0, BLUE_LIGHT], [1, ORANGE_LIGHT]],
+        showscale=False,
+        hoverinfo="skip",
+        showlegend=False,
+    )
+)
+present = set(np.unique(region).astype(int).tolist())
+for cls, color, label in [
+    (0, BLUE_LIGHT, "의사결정트리가 '아님'이라고 답하는 칸"),
+    (1, ORANGE_LIGHT, "의사결정트리가 '뇌졸중'이라고 답하는 칸"),
+]:
+    if cls in present:
+        fig.add_trace(
+            go.Scatter(
+                x=[None],
+                y=[None],
+                mode="markers",
+                marker=dict(symbol="square", size=14, color=color),
+                name=label,
+            )
+        )
+
+# 로지스틱 회귀가 0.5로 가르는 선
+segment, side = logistic_line(logit, selected, fixed, x_feat, y_feat, xr, yr)
+if segment is not None:
+    (x0, y0), (x1, y1) = segment
+    fig.add_trace(
+        go.Scatter(
+            x=[x0, x1],
+            y=[y0, y1],
+            mode="lines",
+            line=dict(color=LINE_COLOR, width=3),
+            name="로지스틱 회귀가 0.5로 가르는 선",
+            hoverinfo="skip",
+        )
+    )
+
+# 테스트 데이터 점 (실제 뇌졸중 여부로 색을 나눈다)
+rng = np.random.default_rng(0)
+px = X_test[x_feat].to_numpy(dtype=float)
+py = X_test[y_feat].to_numpy(dtype=float)
+shown_x = px + rng.uniform(-0.06, 0.06, len(px)) if x_feat in BINARY else px
+shown_y = py + rng.uniform(-0.06, 0.06, len(py)) if y_feat in BINARY else py
+x_fmt = ".0f" if x_feat in BINARY else ".1f"
+y_fmt = ".0f" if y_feat in BINARY else ".1f"
+for value, color, size, label in [
+    (0, BLUE, 6, "실제로 뇌졸중이 아님"),
+    (1, ORANGE, 8, "실제로 뇌졸중을 겪음(양성)"),
+]:
+    m = (y_test == value).to_numpy()
+    fig.add_trace(
+        go.Scatter(
+            x=shown_x[m],
+            y=shown_y[m],
+            mode="markers",
+            name=label,
+            marker=dict(color=color, size=size, opacity=0.75, line=dict(width=0.5, color="rgba(0,0,0,0.35)")),
+            customdata=np.column_stack([px[m], py[m]]),
+            hovertemplate=(
+                f"{KOREAN[x_feat]}: %{{customdata[0]:{x_fmt}}}<br>"
+                f"{KOREAN[y_feat]}: %{{customdata[1]:{y_fmt}}}<extra>{label}</extra>"
+            ),
+        )
+    )
+
+fig.update_xaxes(title_text=KOREAN[x_feat], range=list(xr))
+fig.update_yaxes(title_text=KOREAN[y_feat], range=list(yr))
+for axis_update, feat in [(fig.update_xaxes, x_feat), (fig.update_yaxes, y_feat)]:
+    if feat in BINARY:
+        axis_update(tickvals=[0, 1], ticktext=["없음", "있음"])
+fig.update_layout(
+    height=580,
+    margin=dict(l=10, r=10, t=20, b=10),
+    legend=dict(orientation="h", yanchor="top", y=-0.15, xanchor="left", x=0),
+)
+st.plotly_chart(fig)
+
+others = [f for f in selected if f not in (x_feat, y_feat)]
+if others:
+    parts = [f"{KOREAN[f]} {value_text(f, fixed[f])}" for f in others]
+    st.write("두 축이 아닌 속성은 테스트 데이터의 중앙값에 세워 두고 계산했습니다: " + ", ".join(parts) + ".")
+else:
+    st.write("고른 속성이 두 개뿐이라 모두 축으로 쓰였고, 따로 세워 둔 속성은 없습니다.")
+if segment is None:
+    msg = "로지스틱 회귀가 0.5로 가르는 선은 이 그림의 범위 밖에 있어 그려지지 않았습니다."
+    if side is not None:
+        msg += f" 이 그림 안에서는 확률 모델이 어디서나 '{side}'이라고 답합니다."
+    st.info(msg)
+if x_feat in BINARY or y_feat in BINARY:
+    st.caption("고혈압·심장병 축은 점이 겹치지 않도록 살짝 흩어서 찍었습니다. 마우스를 올리면 실제 값이 보입니다.")
+
+# --- 의사결정트리 가지 그림 -------------------------------------------------
+st.subheader("의사결정트리가 던진 질문")
+dot, leaf_answers, asked = tree_dot(tree, X_train, y_train, selected)
+try:
+    st.graphviz_chart(dot, use_container_width=True)
+except TypeError:  # 오래된 스트림릿에는 이 옵션이 없다
+    st.graphviz_chart(dot)
+
+n_leaf = len(leaf_answers)
+n_no = sum(1 for a in leaf_answers if a == 0)
+st.write(
+    f"답을 내는 마디는 모두 {n_leaf}칸이고, 그중 {n_no}칸이 '아님'이라고 답합니다. "
+    f"(나머지 {n_leaf - n_no}칸은 '뇌졸중'이라고 답합니다.)"
+)
+if asked:
+    st.write("고른 속성 가운데 이 나무가 실제로 물은 것은 " + ", ".join(KOREAN[f] for f in asked) + "입니다.")
+else:
+    st.write("이 나무는 아무것도 묻지 않고 바로 답을 냈습니다.")
