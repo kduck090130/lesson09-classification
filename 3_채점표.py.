@@ -1,0 +1,238 @@
+# -*- coding: utf-8 -*-
+"""채점표 페이지: 두 모델의 혼동행렬과 네 지표를 보고, 틀린 사람들의 목록을 살펴본다."""
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from sklearn.dummy import DummyClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier
+
+st.set_page_config(page_title="채점표", layout="wide")
+
+# ---------------------------------------------------------------------------
+# 설정 ('분류 모델' 페이지와 같은 방법)
+# ---------------------------------------------------------------------------
+# '분류 모델' 페이지와 같은 데이터 주소를 여기에 넣어 주세요. (UTF-8로 읽습니다)
+DATA_URL = ""
+
+# '분류 모델' 페이지에서 처음 골라져 있는 넷을 그대로 입력으로 씁니다.
+SELECTED = ["age", "avg_glucose_level", "hypertension", "heart_disease"]
+NEEDED = ["id", "stroke", "age", "avg_glucose_level", "hypertension", "heart_disease"]
+KOREAN = {
+    "age": "나이",
+    "avg_glucose_level": "평균 혈당",
+    "hypertension": "고혈압",
+    "heart_disease": "심장병",
+}
+
+LOGIT_NAME = "로지스틱 회귀(확률로 답하는 모델)"
+TREE_NAME = "의사결정트리(질문으로 답하는 모델)"
+BASE_NAME = "다수 클래스 모델(훈련용에서 많은 쪽으로만 답하는 모델)"
+
+NA_TEXT = "계산할 수 없음"
+LIST_LIMIT = 20
+
+
+# ---------------------------------------------------------------------------
+# 데이터
+# ---------------------------------------------------------------------------
+@st.cache_data(show_spinner="데이터를 불러오는 중입니다...")
+def load_data(url):
+    return pd.read_csv(url, encoding="utf-8")
+
+
+def prepare(raw):
+    """필요한 열을 숫자로 바꾸고, 번호(id) 순으로 정렬한다."""
+    missing = [c for c in NEEDED if c not in raw.columns]
+    if missing:
+        st.error("데이터에 다음 열이 없습니다: " + ", ".join(missing))
+        st.stop()
+    df = raw.copy()
+    for c in NEEDED:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.sort_values("id", kind="stable").reset_index(drop=True)
+
+
+def split_train_test(df):
+    """열 명씩 묶어 각 묶음의 앞 세 명을 테스트용으로 고정한다."""
+    is_test = (np.arange(len(df)) % 10) < 3
+    return df[~is_test].reset_index(drop=True), df[is_test].reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 계산
+# ---------------------------------------------------------------------------
+def confusion_counts(y_true, y_pred):
+    """뇌졸중(1)을 양성으로 두고 TP·FN·FP·TN을 센다. 행은 실제, 열은 예측이다."""
+    cm = confusion_matrix(y_true, y_pred, labels=[1, 0])
+    return {"TP": int(cm[0, 0]), "FN": int(cm[0, 1]), "FP": int(cm[1, 0]), "TN": int(cm[1, 1])}
+
+
+def metrics_from(c):
+    """네 칸에서 정확도·재현율·정밀도·F1을 구한다. 계산할 수 없으면 None."""
+    tp, fn, fp, tn = c["TP"], c["FN"], c["FP"], c["TN"]
+    total = tp + fn + fp + tn
+    accuracy = (tp + tn) / total if total else None
+    recall = tp / (tp + fn) if (tp + fn) else None  # 분모: 실제 뇌졸중인 사람 수
+    precision = tp / (tp + fp) if (tp + fp) else None  # 분모: 뇌졸중이라 예측한 사람 수
+    if precision is None or recall is None or (precision + recall) == 0:
+        f1 = None
+    else:
+        f1 = 2 * precision * recall / (precision + recall)
+    return {"정확도": accuracy, "재현율": recall, "정밀도": precision, "F1": f1}
+
+
+def pct(v):
+    return NA_TEXT if v is None else f"{v * 100:.2f}%"
+
+
+def confusion_table(c):
+    """실제를 행, 예측을 열로 하고 합계를 붙인 표를 만든다."""
+    pos_total = c["TP"] + c["FN"]
+    neg_total = c["FP"] + c["TN"]
+    return pd.DataFrame(
+        [
+            [f"TP  {c['TP']:,}명", f"FN  {c['FN']:,}명", f"{pos_total:,}명"],
+            [f"FP  {c['FP']:,}명", f"TN  {c['TN']:,}명", f"{neg_total:,}명"],
+            [f"{c['TP'] + c['FP']:,}명", f"{c['FN'] + c['TN']:,}명", f"{pos_total + neg_total:,}명"],
+        ],
+        index=["실제 뇌졸중", "실제 아님", "합계"],
+        columns=["예측 뇌졸중", "예측 아님", "합계"],
+    )
+
+
+def person_list(test, mask):
+    """번호·나이·평균 혈당·고혈압·심장병을 담아 나이가 많은 순으로 정렬한다."""
+    sub = test.loc[mask, ["id", "age", "avg_glucose_level", "hypertension", "heart_disease"]]
+    sub = sub.sort_values(["age", "id"], ascending=[False, True], kind="stable")
+    out = pd.DataFrame(
+        {
+            "번호": sub["id"].astype(int).to_numpy(),
+            "나이": sub["age"].round(1).to_numpy(),
+            "평균 혈당": sub["avg_glucose_level"].round(2).to_numpy(),
+            "고혈압": np.where(sub["hypertension"].to_numpy() >= 0.5, "있음", "없음"),
+            "심장병": np.where(sub["heart_disease"].to_numpy() >= 0.5, "있음", "없음"),
+        }
+    )
+    return out
+
+
+def show_list(title_name, people):
+    total = len(people)
+    if total > LIST_LIMIT:
+        st.markdown(f"**{title_name} (전체 {total:,}명 중 앞 {LIST_LIMIT}명)**")
+    else:
+        st.markdown(f"**{title_name} (전체 {total:,}명)**")
+    if total == 0:
+        st.write("해당하는 사람이 없습니다.")
+        return
+    st.dataframe(people.head(LIST_LIMIT), hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# 페이지
+# ---------------------------------------------------------------------------
+st.title("채점표")
+st.write("테스트 데이터로 두 모델의 답을 채점하고, 어떤 사람을 놓치거나 헛짚었는지 살펴봅니다.")
+
+if not DATA_URL.strip():
+    st.error("파일 맨 위의 DATA_URL에 '분류 모델' 페이지와 같은 데이터 주소를 넣어 주세요.")
+    st.stop()
+
+try:
+    raw = load_data(DATA_URL)
+except Exception as e:  # noqa: BLE001
+    st.error(f"데이터를 불러오지 못했습니다: {e}")
+    st.stop()
+
+df = prepare(raw)
+if df[NEEDED].isna().any().any():
+    bad = [c for c in NEEDED if df[c].isna().any()]
+    st.error("다음 열에 비어 있거나 숫자가 아닌 값이 있어 진행할 수 없습니다: " + ", ".join(bad))
+    st.stop()
+
+train, test = split_train_test(df)
+X_train, X_test = train[SELECTED], test[SELECTED]
+y_train, y_test = train["stroke"].astype(int), test["stroke"].astype(int)
+
+st.caption(
+    "입력 속성은 " + "·".join(KOREAN[f] for f in SELECTED) + "입니다. "
+    "'분류 모델' 페이지와 같이 번호(id) 순으로 정렬해 열 명씩 묶고, 각 묶음의 앞 세 명을 테스트용으로 "
+    f"고정했으며, 나머지 {len(train):,}명으로만 학습과 크기 맞추기를 했습니다."
+)
+
+# 두 모델과 기준 모델: '분류 모델' 페이지와 같은 설정
+logit = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
+logit.fit(X_train, y_train)
+tree = DecisionTreeClassifier(max_depth=3, min_samples_split=5, random_state=42)
+tree.fit(X_train, y_train)
+baseline = DummyClassifier(strategy="most_frequent")
+baseline.fit(X_train, y_train)
+
+models = {LOGIT_NAME: logit, TREE_NAME: tree, BASE_NAME: baseline}
+preds = {name: m.predict(X_test) for name, m in models.items()}
+counts = {name: confusion_counts(y_test, p) for name, p in preds.items()}
+
+n_test = len(test)
+n_pos = int((y_test == 1).sum())
+
+# --- 혼동행렬 ---------------------------------------------------------------
+st.subheader("혼동행렬")
+st.write(
+    f"테스트용 {n_test:,}명 중 뇌졸중인 사람은 {n_pos:,}명({n_pos / n_test * 100:.2f}%)입니다."
+)
+st.caption(
+    "행은 실제, 열은 예측입니다. 뇌졸중을 양성으로 둡니다. "
+    "TP: 뇌졸중이라 예측했고 실제로 뇌졸중 / FN: 아니라 예측했는데 실제로 뇌졸중(놓친 환자) / "
+    "FP: 뇌졸중이라 예측했는데 실제로는 아님(헛짚은 사람) / TN: 아니라 예측했고 실제로도 아님"
+)
+cm1, cm2 = st.columns(2)
+with cm1:
+    st.markdown(f"**{LOGIT_NAME}**")
+    st.table(confusion_table(counts[LOGIT_NAME]))
+with cm2:
+    st.markdown(f"**{TREE_NAME}**")
+    st.table(confusion_table(counts[TREE_NAME]))
+
+# --- 지표 표 ----------------------------------------------------------------
+st.subheader("네 가지 지표")
+st.write(
+    f"테스트용 {n_test:,}명 중 뇌졸중인 사람은 {n_pos:,}명입니다. 아래 표는 모두 테스트 데이터로 구했습니다."
+)
+rows = []
+for name in models:
+    m = metrics_from(counts[name])
+    rows.append([pct(m["정확도"]), pct(m["재현율"]), pct(m["정밀도"]), pct(m["F1"])])
+st.table(pd.DataFrame(rows, index=list(models), columns=["정확도", "재현율", "정밀도", "F1"]))
+st.caption(
+    "정확도 = (TP+TN) ÷ 전체 / 재현율 = TP ÷ (TP+FN), 분모는 실제 뇌졸중인 사람 수 / "
+    "정밀도 = TP ÷ (TP+FP), 분모는 뇌졸중이라 예측한 사람 수 / "
+    "F1 = 2 × 정밀도 × 재현율 ÷ (정밀도 + 재현율). "
+    f"뇌졸중이라 예측한 사람이 0명이면 정밀도와 F1은 '{NA_TEXT}'으로 적습니다."
+)
+
+# --- 놓친 환자와 헛짚은 사람 -------------------------------------------------
+st.subheader("놓친 환자와 헛짚은 사람")
+model_name = st.selectbox("어느 모델의 목록을 볼까요?", [LOGIT_NAME, TREE_NAME])
+pred = preds[model_name]
+is_pos = (y_test == 1).to_numpy()
+missed = person_list(test, is_pos & (pred == 0))  # 실제 뇌졸중인데 아니라고 예측
+wrong = person_list(test, (~is_pos) & (pred == 1))  # 아닌데 뇌졸중이라고 예측
+
+left, right = st.columns(2)
+with left:
+    show_list("놓친 환자: 실제 뇌졸중인데 아니라고 예측", missed)
+with right:
+    show_list("헛짚은 사람: 아닌데 뇌졸중이라고 예측", wrong)
+
+c = counts[model_name]
+same = len(missed) == c["FN"] and len(wrong) == c["FP"]
+st.write(
+    f"놓친 환자 {len(missed):,}명은 혼동행렬의 FN {c['FN']:,}명과, "
+    f"헛짚은 사람 {len(wrong):,}명은 FP {c['FP']:,}명과 "
+    + ("같습니다." if same else "다릅니다. 계산을 다시 확인해야 합니다.")
+)
